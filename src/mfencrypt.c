@@ -21,7 +21,7 @@ typedef enum Mode {
 int main(int argc, char *argv[]) {
     int return_value = 0;
 
-    while (!RAND_poll());
+    //while (!RAND_poll());
 
     OSSL_LIB_CTX *lib_context = NULL;
 
@@ -266,6 +266,9 @@ int main(int argc, char *argv[]) {
     lib_context = OSSL_LIB_CTX_new();
     if (!lib_context) goto handle_error;
 
+    // OSSL_LIB_CTX_new() sets errno to 2 for some reason??
+    errno = 0;
+
     if (action == ENCRYPT) {
         success = merge_files(
             argv + infiles,
@@ -310,7 +313,7 @@ handle_error:
     } else {
         fprintf(
             stderr,
-            "%s: Failed with unknown error",
+            "%s: Failed with unknown error\n",
             argv[0]
         );
     }

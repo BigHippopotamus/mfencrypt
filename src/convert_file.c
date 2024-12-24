@@ -4,6 +4,7 @@
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/types.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,16 @@
 #define FIELD_SIZE_BYTES 260
 
 #define RAND_STRENGTH 256
+
+#define KEY_SIZE 16
+#define IV_SIZE 16
+#define SALT_SIZE 16
+#define PBKDF2_ROUNDS 600000
+
+#define CIPHER_NAME "AES-128-CFB"
+#define PBKDF2_NAME "SHA2-256"
+
+#define PREFIX_SIZE (HASH_SIZE + IV_SIZE + SALT_SIZE)
 
 void calculate_lps(unsigned char *pattern, int size, unsigned int *lps) {
     lps[0] = 0;
@@ -64,7 +75,7 @@ int stream_kmp(unsigned char *needle,
 
 int merge_files(char *infiles[],
                 char *outfile,
-                char *keys[],
+                char *passwords[],
                 int real_count,
                 int extra_padding,
                 int fake_count,
@@ -86,16 +97,42 @@ int merge_files(char *infiles[],
 
     uint64_t *padding = NULL;
 
-    unsigned char (*key_hash)[HASH_SIZE] = NULL;
+    /*
+     * PREFIX STRUCTURE: [HASH][IV][SALT]
+    */
+    unsigned char (*prefix)[PREFIX_SIZE] = NULL;
     unsigned int (*kmp_lps)[HASH_SIZE] = NULL;
     unsigned char sha_temp[HASH_SIZE];
 
     int *kmp_match_status = NULL;
-    int *hash_used = NULL;
+    int *prefix_used = NULL;
+
+    EVP_CIPHER *encryption_cipher = NULL;
+    EVP_MD *pbkdf2_algorithm = NULL;
+    EVP_CIPHER_CTX **encryption_contexts = NULL;
+    unsigned char (*keys)[KEY_SIZE] = NULL;
 
     unsigned char bytes[BLOCK_SIZE] = {0};
 
     int success;
+
+    encryption_cipher = EVP_CIPHER_fetch(
+        lib_context,
+        CIPHER_NAME,
+        NULL
+    );
+    if (!encryption_cipher) goto handle_error;
+
+    unsigned int ivlen = EVP_CIPHER_get_iv_length(encryption_cipher);
+    unsigned int keylen = EVP_CIPHER_get_key_length(encryption_cipher);
+    if (ivlen != IV_SIZE || keylen != KEY_SIZE) goto handle_error;
+
+    pbkdf2_algorithm = EVP_MD_fetch(
+        lib_context,
+        PBKDF2_NAME,
+        NULL
+    );
+    if (!pbkdf2_algorithm) goto handle_error;
 
     inputs = calloc(real_count, sizeof(*inputs));
     if (!inputs) goto handle_error;
@@ -147,15 +184,15 @@ int merge_files(char *infiles[],
     padding = calloc(real_count, sizeof(*padding));
     if (!padding) goto handle_error;
 
-    uint64_t required_padding = extra_padding * BLOCK_SIZE + HASH_SIZE +
+    uint64_t required_padding = extra_padding * BLOCK_SIZE + PREFIX_SIZE +
         (-max_size % BLOCK_SIZE) + BLOCK_SIZE;
     for (int i = 0; i < real_count; i++) {
         padding[i] = (max_size - filesizes[i]) + required_padding;
     }
 
-    // Calculate hashes of the keys
-    key_hash = calloc(real_count, sizeof(*key_hash));
-    if (!key_hash) goto handle_error;
+    // Calculate hashes of the passwords
+    prefix = calloc(real_count, sizeof(*prefix));
+    if (!prefix) goto handle_error;
 
     kmp_lps = calloc(real_count, sizeof(*kmp_lps));
     if (!kmp_lps) goto handle_error;
@@ -163,21 +200,30 @@ int merge_files(char *infiles[],
     for (int i = 0; i < real_count; i++) {
         // Padding hash
         success = EVP_Digest(
-            keys[i],
-            strlen(keys[i]),
-            key_hash[i],
+            passwords[i],
+            strlen(passwords[i]),
+            prefix[i],
             NULL,
             EVP_sha512_256(),
             NULL
         );
         if (!success) goto handle_error;
 
-        calculate_lps(key_hash[i], HASH_SIZE, kmp_lps[i]);
+        calculate_lps(prefix[i], HASH_SIZE, kmp_lps[i]);
+
+        // IV + salt
+        success = RAND_bytes_ex(
+            lib_context,
+            prefix[i] + HASH_SIZE,
+            IV_SIZE + SALT_SIZE,
+            RAND_STRENGTH
+        );
+        if (!success) goto handle_error;
 
         // x value hash
         success = EVP_Digest(
-            keys[i],
-            strlen(keys[i]),
+            passwords[i],
+            strlen(passwords[i]),
             sha_temp,
             NULL,
             EVP_sha256(),
@@ -220,6 +266,40 @@ int merge_files(char *infiles[],
         }
     }
 
+    // Initialize AES cipher for files
+    keys = calloc(real_count, sizeof(*keys));
+    if (!keys) goto handle_error;
+
+    encryption_contexts = 
+        OPENSSL_zalloc(real_count * sizeof(*encryption_contexts));
+    if (!encryption_contexts) goto handle_error;
+
+    for (int i = 0; i < real_count; i++) {
+        success = PKCS5_PBKDF2_HMAC(
+            passwords[i],
+            strlen(passwords[i]),
+            prefix[i] + HASH_SIZE + IV_SIZE,
+            SALT_SIZE,
+            PBKDF2_ROUNDS,
+            pbkdf2_algorithm,
+            KEY_SIZE,
+            keys[i]
+        );
+        if (!success) goto handle_error;
+
+        encryption_contexts[i] = EVP_CIPHER_CTX_new();
+        if (!encryption_contexts[i]) goto handle_error;
+        
+        success = EVP_EncryptInit_ex2(
+            encryption_contexts[i],
+            encryption_cipher,
+            keys[i],
+            prefix[i] + HASH_SIZE,
+            NULL
+        );
+        if (!success) goto handle_error;
+    }
+
     // Generate the output
     uint64_t blocks = (filesizes[0] + padding[0]) / BLOCK_SIZE;
     output = fopen(outfile, "wb");
@@ -232,32 +312,32 @@ int merge_files(char *infiles[],
     if (!success) goto handle_error;
 
     kmp_match_status = calloc(real_count, sizeof(*kmp_match_status));
-    hash_used = calloc(real_count, sizeof(*hash_used));
+    prefix_used = calloc(real_count, sizeof(*prefix_used));
     for (uint64_t i = 0; i < blocks; i++) {
         // Generate data/padding to be used
         for (int j = 0; j < real_count; j++) {
             int old_status = kmp_match_status[j];
-            unsigned int rand_bytes, hash_bytes, data_bytes;
+            unsigned int rand_bytes, prefix_bytes, data_bytes;
 
-            if (padding[j] >= HASH_SIZE + BLOCK_SIZE) {
+            if (padding[j] >= PREFIX_SIZE + BLOCK_SIZE) {
                 rand_bytes = BLOCK_SIZE;
-                hash_bytes = 0;
+                prefix_bytes = 0;
                 data_bytes = 0;
-            } else if (padding[j] > HASH_SIZE) {
-                rand_bytes = padding[j] - HASH_SIZE;
-                hash_bytes = BLOCK_SIZE - rand_bytes;
+            } else if (padding[j] > PREFIX_SIZE) {
+                rand_bytes = padding[j] - PREFIX_SIZE;
+                prefix_bytes = BLOCK_SIZE - rand_bytes;
                 data_bytes = 0;
             } else if (padding[j] > BLOCK_SIZE) {
                 rand_bytes = 0;
-                hash_bytes = BLOCK_SIZE;
+                prefix_bytes = BLOCK_SIZE;
                 data_bytes = 0;
             } else if (padding[j] > 0) {
                 rand_bytes = 0;
-                hash_bytes = padding[j];
-                data_bytes = BLOCK_SIZE - hash_bytes;
+                prefix_bytes = padding[j];
+                data_bytes = BLOCK_SIZE - prefix_bytes;
             } else {
                 rand_bytes = 0;
-                hash_bytes = 0;
+                prefix_bytes = 0;
                 data_bytes = BLOCK_SIZE;
             }
             int check_hash_in_rand = rand_bytes > 0;
@@ -275,14 +355,14 @@ int merge_files(char *infiles[],
                 used_bytes += rand_bytes;
             }
 
-            if (hash_bytes > 0) {
+            if (prefix_bytes > 0) {
                 memcpy(
                     bytes + used_bytes,
-                    key_hash[j] + hash_used[j],
-                    hash_bytes
+                    prefix[j] + prefix_used[j],
+                    prefix_bytes
                 );
 
-                used_bytes += hash_bytes;
+                used_bytes += prefix_bytes;
             }
 
             if (data_bytes > 0) {
@@ -294,13 +374,23 @@ int merge_files(char *infiles[],
                 ) == data_bytes);
                 if (!success) goto handle_error;
 
+                int temp;
+                success = EVP_EncryptUpdate(
+                    encryption_contexts[j],
+                    bytes + used_bytes,
+                    &temp,
+                    bytes + used_bytes,
+                    data_bytes
+                );
+                if (!success) goto handle_error;
+
                 used_bytes += data_bytes;
             }
 
             // Ensure random bytes are not hash
             if (check_hash_in_rand) {
                 int hash_in_rand = stream_kmp(
-                    key_hash[j],
+                    prefix[j],
                     kmp_lps[j],
                     HASH_SIZE,
                     bytes,
@@ -308,7 +398,7 @@ int merge_files(char *infiles[],
                     &kmp_match_status[j]
                 );
 
-                bool safety_continue = (padding[j] == HASH_SIZE + BLOCK_SIZE
+                bool safety_continue = (padding[j] == PREFIX_SIZE + BLOCK_SIZE
                                         && kmp_match_status[j] > 0);
                 if (hash_in_rand || safety_continue) {
                     j--;
@@ -317,8 +407,8 @@ int merge_files(char *infiles[],
                 }
             }
 
-            hash_used[j] += hash_bytes;
-            padding[j] -= rand_bytes + hash_bytes;
+            prefix_used[j] += prefix_bytes;
+            padding[j] -= rand_bytes + prefix_bytes;
             filesizes[j] -= data_bytes;
 
             success = (BN_bin2bn(
@@ -383,6 +473,17 @@ int merge_files(char *infiles[],
         }
     }
 
+    // Ensure encryption of files proceeded correctly
+    for (int i = 0; i < real_count; i++) {
+        int temp;
+        success = EVP_EncryptFinal_ex(
+            encryption_contexts[i],
+            bytes,
+            &temp
+        );
+        if (!success) goto handle_error;
+    }
+
     goto cleanup;
 
 handle_error:
@@ -390,9 +491,9 @@ handle_error:
 
 cleanup:
     free(kmp_match_status);
-    free(hash_used);
+    free(prefix_used);
 
-    free(key_hash);
+    free(prefix);
     free(kmp_lps);
 
     free(padding);
@@ -400,16 +501,25 @@ cleanup:
     BN_CTX_free(context);
 
     for (int i = 0; i < real_count; i++) {
-        BN_free(x[i]);
-        BN_free(y[i]);
-        BN_free(generator[i]);
+        if (x) BN_free(x[i]);
+        if (y) BN_free(y[i]);
+        if (generator) BN_free(generator[i]);
+        if (encryption_contexts) {
+            EVP_CIPHER_CTX_cleanup(encryption_contexts[i]);
+            EVP_CIPHER_CTX_free(encryption_contexts[i]);
+        }
         if (inputs[i]) fclose(inputs[i]);
     }
 
+    free(keys);
+    OPENSSL_free(encryption_contexts);
+    EVP_MD_free(pbkdf2_algorithm);
+    EVP_CIPHER_free(encryption_cipher);
+
     for (int i = real_count; i < count; i++) {
-        BN_free(x[i]);
-        BN_free(y[i]);
-        BN_free(generator[i]);
+        if (x) BN_free(x[i]);
+        if (y) BN_free(y[i]);
+        if (generator) BN_free(generator[i]);
     }
 
     if (output) fclose(output);
@@ -427,9 +537,23 @@ cleanup:
     return return_value;
 }
 
+void read_rest_of_block(unsigned char *to, 
+                        unsigned char *from,
+                        int *max_read, 
+                        int *start_read) {
+    if (*max_read <= 0 || *start_read >= BLOCK_SIZE) return;
+    
+    int bytes_to_read = (*max_read < BLOCK_SIZE - *start_read) ?
+        *max_read : BLOCK_SIZE - *start_read;
+
+    memcpy(to, from + *start_read, bytes_to_read);
+    *max_read -= bytes_to_read;
+    *start_read += bytes_to_read;
+}
+
 int regenerate_file(char *infile,
                     char *outfile,
-                    char *key,
+                    char *password,
                     OSSL_LIB_CTX *lib_context) {
     int return_value = 1;
 
@@ -443,7 +567,29 @@ int regenerate_file(char *infile,
     BIGNUM **generator = NULL;
     BIGNUM *field_mod = NULL, *value_mod = NULL;
 
+    EVP_CIPHER *decryption_cipher = NULL;
+    EVP_MD *pbkdf2_algorithm = NULL;
+    EVP_CIPHER_CTX *decryption_context = NULL;
+    unsigned char key[KEY_SIZE];
+
     int success;
+
+    decryption_cipher = EVP_CIPHER_fetch(
+        lib_context,
+        CIPHER_NAME,
+        NULL
+    );
+    if (!decryption_cipher) goto handle_error;
+
+    unsigned int ivlen = EVP_CIPHER_get_iv_length(decryption_cipher);
+    unsigned int keylen = EVP_CIPHER_get_key_length(decryption_cipher);
+    if (ivlen != IV_SIZE || keylen != KEY_SIZE) goto handle_error;
+
+    pbkdf2_algorithm = EVP_MD_fetch(
+        lib_context,
+        PBKDF2_NAME,
+        NULL
+    );
 
     input = fopen(infile, "rb");
     if (!input) goto handle_error;
@@ -488,28 +634,33 @@ int regenerate_file(char *infile,
     y = BN_new();
     if (!y) goto handle_error;
 
-    unsigned char key_hash[HASH_SIZE];
+    unsigned char hash[HASH_SIZE];
     unsigned int kmp_lps[HASH_SIZE];
     unsigned char sha_temp[HASH_SIZE];
+
+    unsigned char iv[IV_SIZE];
+    int iv_remaining = IV_SIZE;
+    unsigned char salt[SALT_SIZE];
+    int salt_remaining = SALT_SIZE;
 
     // Calculate hashes
     // Padding hash
     success = EVP_Digest(
-        key,
-        strlen(key),
-        key_hash,
+        password,
+        strlen(password),
+        hash,
         NULL,
         EVP_sha512_256(),
         NULL
     );
     if (!success) goto handle_error;
 
-    calculate_lps(key_hash, HASH_SIZE, kmp_lps);
+    calculate_lps(hash, HASH_SIZE, kmp_lps);
 
     // x value hash
     success = EVP_Digest(
-        key,
-        strlen(key),
+        password,
+        strlen(password),
         sha_temp,
         NULL,
         EVP_sha256(),
@@ -570,11 +721,12 @@ int regenerate_file(char *infile,
         success = BN_bn2binpad(y, bytes, BLOCK_SIZE);
         if (!success) goto handle_error;
 
+        int start_read = (padding_over) ? 0 : BLOCK_SIZE;
+
         // Only print to file if padding is over
-        //*
         if (!padding_over) {
             int hash_location = stream_kmp(
-                key_hash,
+                hash,
                 kmp_lps,
                 HASH_SIZE,
                 bytes,
@@ -584,25 +736,84 @@ int regenerate_file(char *infile,
 
             if (hash_location) {
                 padding_over = true;
+                start_read = hash_location;
+            }
+        }
 
-                int valuable_bytes = BLOCK_SIZE - hash_location;
-                success = (fwrite(
-                    bytes + hash_location,
-                    sizeof(bytes[0]),
-                    valuable_bytes,
-                    output
-                ) == valuable_bytes);
+        if (padding_over && (iv_remaining > 0 || salt_remaining > 0)) {
+            read_rest_of_block(
+                iv + (IV_SIZE - iv_remaining),
+                bytes,
+                &iv_remaining,
+                &start_read
+            );
+
+            read_rest_of_block(
+                salt + (SALT_SIZE - salt_remaining),
+                bytes,
+                &salt_remaining,
+                &start_read
+            );
+        }
+
+        if (padding_over && iv_remaining == 0 && salt_remaining == 0) {
+            if (!decryption_context) {
+                success = PKCS5_PBKDF2_HMAC(
+                    password,
+                    strlen(password),
+                    salt,
+                    SALT_SIZE,
+                    PBKDF2_ROUNDS,
+                    pbkdf2_algorithm,
+                    KEY_SIZE,
+                    key
+                );
+                if (!success) goto handle_error;
+
+                decryption_context = EVP_CIPHER_CTX_new();
+                if (!decryption_context) goto handle_error;
+                
+                success = EVP_DecryptInit_ex2(
+                    decryption_context,
+                    decryption_cipher,
+                    key,
+                    iv,
+                    NULL
+                );
                 if (!success) goto handle_error;
             }
-        } else {
-            success = (fwrite(
-                bytes,
-                sizeof(bytes[0]),
-                BLOCK_SIZE,
-                output
-            ) == BLOCK_SIZE);
-            if (!success) goto handle_error;
+
+            if (start_read < BLOCK_SIZE) {
+                int temp;
+                success = EVP_DecryptUpdate(
+                    decryption_context,
+                    bytes + start_read,
+                    &temp,
+                    bytes + start_read,
+                    BLOCK_SIZE - start_read
+                );
+                if (!success) goto handle_error;
+
+                success = (fwrite(
+                    bytes + start_read,
+                    sizeof(bytes[0]),
+                    BLOCK_SIZE - start_read,
+                    output
+                ) == BLOCK_SIZE - start_read);
+                if (!success) goto handle_error;
+            }
         }
+    }
+
+    // Ensure decryption of files proceeded correctly
+    if (decryption_context) {
+        int temp;
+        success = EVP_DecryptFinal_ex(
+            decryption_context,
+            bytes,
+            &temp
+        );
+        if (!success) goto handle_error;
     }
 
     goto cleanup;
@@ -618,6 +829,12 @@ cleanup:
         BN_free(generator[i]);
     }
     OPENSSL_free(generator);
+
+    EVP_CIPHER_CTX_cleanup(decryption_context);
+    EVP_CIPHER_CTX_free(decryption_context);
+
+    EVP_MD_free(pbkdf2_algorithm);
+    EVP_CIPHER_free(decryption_cipher);
 
     BN_free(x);
     BN_free(y);
