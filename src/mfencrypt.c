@@ -12,7 +12,7 @@
 typedef enum Mode {
     ENCRYPT,
     DECRYPT,
-    KEY,
+    PASSWORD,
     OUTPUT,
     PADDING,
     FAKES
@@ -28,10 +28,10 @@ int main(int argc, char *argv[]) {
     Mode mode = ENCRYPT;
     Mode action = ENCRYPT;
     int count = 0;
-    int keycount = 0;
+    int passcount = 0;
 
     int infiles = -1;
-    int keys = -1;
+    int passwords = -1;
     int outfile = -1;
     int padding = 0;
     int fakes = 0;
@@ -40,80 +40,94 @@ int main(int argc, char *argv[]) {
 
     bool valid = false;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-d") == 0) {
-            if (count > 0 || mode != ENCRYPT) {
-                break;
+        if (argv[i][0] == '-') {
+            if (strcmp(argv[i], "-d") == 0) {
+                if (count > 0 || mode != ENCRYPT) {
+                    valid = false;
+                    break;
+                } else {
+                    mode = DECRYPT;
+                    action = DECRYPT;
+                }
+            } else if (strcmp(argv[i], "-p") == 0) {
+                if (count == 0 || (mode != ENCRYPT && mode != DECRYPT)) {
+                    valid = false;
+                    break;
+                } else {
+                    mode = PASSWORD;
+                }
+            } else if (strcmp(argv[i], "-o") == 0) {
+                if (mode != PASSWORD) {
+                    valid = false;
+                    break;
+                } else if (passcount < count) {
+                    fprintf(
+                        stderr,
+                        "%s: Cannot have fewer passwords than files\n",
+                        argv[0]
+                    );
+                    exit(EXIT_FAILURE);
+                } else {
+                    mode = OUTPUT;
+                }
+            } else if (strcmp(argv[i], "-pd") == 0) {
+                if (mode != OUTPUT) {
+                    valid = false;
+                    break;
+                } else if (action == DECRYPT) {
+                    fprintf(
+                        stderr,
+                        "%s: Cannot pad when decrypting\n",
+                        argv[0]
+                    );
+                    exit(EXIT_FAILURE);
+                } else if (outfile == -1) {
+                    fprintf(
+                        stderr,
+                        "%s: No output file given\n",
+                        argv[0]
+                    );
+                    exit(EXIT_FAILURE);
+                } else {
+                    valid = false;
+                    mode = PADDING;
+                }
+            } else if (strcmp(argv[i], "-f") == 0) {
+                if (mode != OUTPUT && mode != PADDING) {
+                    valid = false;
+                    break;
+                } else if (action == DECRYPT) {
+                    fprintf(
+                        stderr,
+                        "%s: Cannot insert fakes when decrypting\n",
+                        argv[0]
+                    );
+                    exit(EXIT_FAILURE);
+                } else if (outfile == -1) {
+                    fprintf(
+                        stderr,
+                        "%s: No output file given\n",
+                        argv[0]
+                    );
+                    exit(EXIT_FAILURE);
+                } else if (mode == PADDING && !valid) {
+                    fprintf(
+                        stderr,
+                        "%s: Padding count not given\n",
+                        argv[0]
+                    );
+                    exit(EXIT_FAILURE);
+                } else {
+                    valid = false;
+                    mode = FAKES;
+                }
             } else {
-                mode = DECRYPT;
-                action = DECRYPT;
-            }
-        } else if (strcmp(argv[i], "-k") == 0) {
-            if (count == 0 || (mode != ENCRYPT && mode != DECRYPT)) {
-                break;
-            } else {
-                mode = KEY;
-            }
-        } else if (strcmp(argv[i], "-o") == 0) {
-            if (mode != KEY) {
-                break;
-            } else if (keycount < count) {
                 fprintf(
                     stderr,
-                    "%s: Cannot have fewer keys than files\n",
-                    argv[0]
+                    "%s: Option not recognized: %s\n",
+                    argv[0], argv[i]
                 );
                 exit(EXIT_FAILURE);
-            } else {
-                mode = OUTPUT;
-            }
-        } else if (strcmp(argv[i], "-p") == 0) {
-            if (mode != OUTPUT) {
-                break;
-            } else if (action == DECRYPT) {
-                fprintf(
-                    stderr,
-                    "%s: Cannot pad when decrypting\n",
-                    argv[0]
-                );
-                exit(EXIT_FAILURE);
-            } else if (outfile == -1) {
-                fprintf(
-                    stderr,
-                    "%s: No output file given\n",
-                    argv[0]
-                );
-                exit(EXIT_FAILURE);
-            } else {
-                valid = false;
-                mode = PADDING;
-            }
-        } else if (strcmp(argv[i], "-f") == 0) {
-            if (mode != OUTPUT && mode != PADDING) {
-                break;
-            } else if (action == DECRYPT) {
-                fprintf(
-                    stderr,
-                    "%s: Cannot insert fakes when decrypting\n",
-                    argv[0]
-                );
-                exit(EXIT_FAILURE);
-            } else if (outfile == -1) {
-                fprintf(
-                    stderr,
-                    "%s: No output file given\n",
-                    argv[0]
-                );
-                exit(EXIT_FAILURE);
-            } else if (mode == PADDING && !valid) {
-                fprintf(
-                    stderr,
-                    "%s: Padding count not given\n",
-                    argv[0]
-                );
-                exit(EXIT_FAILURE);
-            } else {
-                valid = false;
-                mode = FAKES;
             }
         } else {
             switch (mode) {
@@ -137,13 +151,13 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
-                case KEY: {
-                    if (keys == -1) keys = i;
-                    keycount++;
-                    if (keycount > count) {
+                case PASSWORD: {
+                    if (passwords == -1) passwords = i;
+                    passcount++;
+                    if (passcount > count) {
                         fprintf(
                             stderr,
-                            "%s: Cannot have more keys than files\n",
+                            "%s: Cannot have more passwords than files\n",
                             argv[0]
                         );
                         exit(EXIT_FAILURE);
@@ -255,9 +269,9 @@ int main(int argc, char *argv[]) {
         fprintf(
             valid ? stdout : stderr,
             "Usage:\n"
-            "Encryption: %1$s FILES... -k KEYS... -o OUTPUT [-p PADDING] "
+            "Encryption: %1$s FILES... -p PASSWORDS... -o OUTPUT [-pd PADDING] "
                 "[-f FAKES]\n"
-            "Decryption: %1$s -d FILE -k KEY -o OUTPUT\n",
+            "Decryption: %1$s -d FILE -p PASSWORD -o OUTPUT\n",
             argv[0]
         ); 
         exit(EXIT_FAILURE);
@@ -273,7 +287,7 @@ int main(int argc, char *argv[]) {
         success = merge_files(
             argv + infiles,
             argv[outfile],
-            argv + keys,
+            argv + passwords,
             count,
             padding,
             fakes,
@@ -284,7 +298,7 @@ int main(int argc, char *argv[]) {
         success = regenerate_file(
             argv[infiles],
             argv[outfile],
-            argv[keys],
+            argv[passwords],
             lib_context
         );
         if (!success) goto handle_error;

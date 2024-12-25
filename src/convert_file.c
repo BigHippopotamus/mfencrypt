@@ -304,8 +304,8 @@ int merge_files(char *infiles[],
     uint64_t blocks = (filesizes[0] + padding[0]) / BLOCK_SIZE;
     output = fopen(outfile, "wb");
 
-    uint64_t header[] = {count, blocks};
-    int header_len = 2;
+    uint64_t header[] = {count, blocks, PBKDF2_ROUNDS};
+    int header_len = 3;
 
     success = 
         (fwrite(header, sizeof(header[0]), header_len, output) == header_len);
@@ -561,7 +561,7 @@ int regenerate_file(char *infile,
     FILE *output = NULL;
     unsigned char bignum_bytes_buffer[FIELD_SIZE_BYTES];
 
-    uint64_t count = 0, blocks;
+    uint64_t count, blocks, rounds;
 
     BIGNUM *x = NULL, *y = NULL;
     BIGNUM **generator = NULL;
@@ -615,6 +615,14 @@ int regenerate_file(char *infile,
     success = (fread(
         &blocks,
         sizeof(blocks),
+        1,
+        input
+    ) == 1);
+    if (!success) goto handle_error;
+
+    success = (fread(
+        &rounds,
+        sizeof(rounds),
         1,
         input
     ) == 1);
@@ -763,7 +771,7 @@ int regenerate_file(char *infile,
                     strlen(password),
                     salt,
                     SALT_SIZE,
-                    PBKDF2_ROUNDS,
+                    rounds,
                     pbkdf2_algorithm,
                     KEY_SIZE,
                     key
