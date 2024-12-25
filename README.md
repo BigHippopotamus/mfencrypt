@@ -19,29 +19,29 @@ The <code>mfencrypt</code> executable will be generated in the <code>build/</cod
 
 <h2>Encryption</h2>
 <h3>Usage<sup>*</sup>:</h3>
-<pre><code>./mfencrypt FILES... -k KEYS... -o OUTPUT [-p PADDING] [-f FAKES]</code></pre>
+<pre><code>./mfencrypt FILES... -p PASSWORDS... -o OUTPUT [-pd PADDING] [-f FAKES]</code></pre>
 <ol>
   <li><code>FILES...</code>: The paths to the files to merge</li>
-  <li><code>KEYS...</code>: The keys corresponding to each file (the number of keys must equal the number of files)</li>
+  <li><code>PASSWORDS...</code>: The passwords corresponding to each file (the number of passwords must equal the number of files)</li>
   <li><code>OUTPUT</code>: The name of the merged file</li>
   <li><code>PADDING</code> (Optional): The number of additional blocks of padding to insert in front of each file</li>
   <li><code>FAKES</code> (Optional): The number of fake sets of data to add for increased security</li>
 </ol>
 
 <h3>Example:</h3>
-<pre><code>./mfencrypt foo.png bar.txt -k pass1 pass2 -o merged.mfen -p 250 -f 51</code></pre>
+<pre><code>./mfencrypt foo.png bar.txt -p pass1 pass2 -o merged.mfen -pd 250 -f 51</code></pre>
 
 <h2>Decryption</h2>
 <h3>Usage<sup>*</sup>:</h3>
-<pre><code>./mfencrypt -d FILE -k KEY -o OUTPUT</code></pre>
+<pre><code>./mfencrypt -d FILE -p PASSWORD -o OUTPUT</code></pre>
 <ol>
   <li><code>FILE</code>: The path to the merged file</li>
-  <li><code>KEY</code>: The key of the file to regenerate</li>
+  <li><code>PASSWORD</code>: The password of the file to regenerate</li>
   <li><code>OUTPUT</code>: The name of the regenerated file</li>
 </ol>
 
 <h3>Example:</h3>
-<pre><code>./mfencrypt -d merged.mfen -k pass2 -o bar.txt</code></pre>
+<pre><code>./mfencrypt -d merged.mfen -p pass2 -o bar.txt</code></pre>
 
 <hr />
 <p><sup>*</sup>The order of arguments must be exactly as specified</p>
